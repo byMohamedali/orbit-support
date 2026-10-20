@@ -25,19 +25,24 @@ jobs:
         run: |
           set -euo pipefail
           # Tags that had no release when this check was added; listed so old tags are not backfilled.
-          gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/.github/tag-release-baseline.txt" 2>/dev/null | sort -u > baseline || : > baseline
-          published() { gh release list -R "$REPO" --exclude-drafts --limit 5000 --json tagName -q '.[].tagName' | sort -u; }
+          if ! gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/.github/tag-release-baseline.txt" > baseline 2> err; then
+            grep -q 'HTTP 404' err || { cat err; exit 1; }
+            : > baseline
+          fi
+          sort -u -o baseline baseline
+          published() { gh release list -R "$REPO" --exclude-drafts --limit 5000 --json tagName -q '.[].tagName' | sort -u > released; }
           if [ "$EVENT" = push ]; then
             [ "$DELETED" = true ] && exit 0
-            grep -qxF "$TAG" baseline && { echo "$TAG is in the baseline"; exit 0; }
+            grep -qxF -- "$TAG" baseline && { echo "$TAG is in the baseline"; exit 0; }
             for _ in $(seq 30); do
-              published | grep -qxF "$TAG" && { echo "$TAG has a release"; exit 0; }
+              published
+              grep -qxF -- "$TAG" released && { echo "$TAG has a release"; exit 0; }
               sleep 10
             done
             echo "::error::Tag $TAG has no published GitHub release. Create tags with tag-release, which makes the tag and the release together."
             exit 1
           fi
-          published > released
+          published
           gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
             query($owner: String!, $name: String!, $endCursor: String) {
               repository(owner: $owner, name: $name) {
