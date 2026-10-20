@@ -1,0 +1,60 @@
+name: Tag has a release
+
+on:
+  push:
+    tags: ['**']
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Every tag has a published GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          DELETED: ${{ github.event.deleted }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Tags that had no release when this check was added; listed so old tags are not backfilled.
+          if ! gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/.github/tag-release-baseline.txt" > baseline 2> err; then
+            grep -q 'HTTP 404' err || { cat err; exit 1; }
+            : > baseline
+          fi
+          sort -u -o baseline baseline
+          published() { gh release list -R "$REPO" --exclude-drafts --limit 5000 --json tagName -q '.[].tagName' | sort -u > released; }
+          if [ "$EVENT" = push ]; then
+            [ "$DELETED" = true ] && exit 0
+            grep -qxF -- "$TAG" baseline && { echo "$TAG is in the baseline"; exit 0; }
+            for _ in $(seq 30); do
+              published
+              grep -qxF -- "$TAG" released && { echo "$TAG has a release"; exit 0; }
+              sleep 10
+            done
+            echo "::error::Tag $TAG has no published GitHub release. Create tags with tag-release, which makes the tag and the release together."
+            exit 1
+          fi
+          published
+          gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
+            query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                refs(refPrefix: "refs/tags/", first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { name }
+                }
+              }
+            }' --jq '.data.repository.refs.nodes[].name' | sort -u > tags
+          missing=$(comm -23 tags released | comm -23 - baseline)
+          if [ -n "$missing" ]; then
+            echo "$missing" | while read -r t; do echo "::error::Tag $t has no published GitHub release"; done
+            exit 1
+          fi
+          echo "All $(comm -23 tags baseline | wc -l | tr -d ' ') tags outside the baseline have releases."
